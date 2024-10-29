@@ -1,0 +1,199 @@
+- hosts: remote_debian
+  become: yes
+  vars_files:
+    - env.yml
+
+  tasks:
+    - name: Create user
+      user:
+        name: "{{ admin_user }}"
+        shell: /bin/bash
+        state: present
+
+    - name: Configure sudoers
+      lineinfile:
+        path: /etc/sudoers
+        state: present
+        regexp: '^{{ admin_user }} '
+        line: '{{ admin_user }} ALL=(ALL:ALL) NOPASSWD:ALL'
+        validate: 'visudo -cf %s'
+
+    - name: Generate SSH key pair for admin_user
+      user:
+        name: "{{ admin_user }}"
+        generate_ssh_key: yes
+        ssh_key_bits: 2048
+        
+    - name: Ensure .ssh directory exists
+      file:
+        path: "/home/{{ admin_user }}/.ssh"
+        state: directory
+        owner: "{{ admin_user }}"
+        group: "{{ admin_user }}"
+        mode: '0700'
+
+    - name: Add public key to authorized_keys
+      shell: cat /home/{{ admin_user }}/.ssh/id_rsa.pub >> /home/{{ admin_user }}/.ssh/authorized_keys
+      args:
+        creates: "/home/{{ admin_user }}/.ssh/authorized_keys"
+      become_user: "{{ admin_user }}"
+
+    - name: Fetch private key
+      fetch:
+        src: "/home/{{ admin_user }}/.ssh/id_rsa"
+        dest: "./{{ admin_user }}_id_rsa"
+        flat: yes
+        mode: '0600'
+      become: yes
+
+    - name: Set SSH port
+      shell: sed -i 's/^#Port 22/Port {{ ssh_port }}/' /etc/ssh/sshd_config
+      become: yes
+
+    - name: Update APT cache
+      apt:
+        update_cache: yes
+
+    - name: Upgrade packages
+      apt:
+        upgrade: dist
+        autoremove: yes
+
+    - name: Install NTP
+      apt:
+        name: ntp
+        state: present
+
+    - name: Install dependencies
+      apt:
+        name:
+          - gnupg
+          - lsb-release
+          - wget
+          - python3-psycopg2
+        state: present
+
+    - name: Add PostgreSQL GPG key
+      apt_key:
+        url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        state: present
+
+    - name: Add PostgreSQL repo
+      apt_repository:
+        repo: "deb http://apt.postgresql.org/pub/repos/apt/ bullseye-pgdg main"
+        state: present
+
+    - name: Update APT cache
+      apt:
+        update_cache: yes
+
+    - name: Install PostgreSQL
+      apt:
+        name: "postgresql-16"
+        state: present
+
+    - name: Configure PostgreSQL
+      lineinfile:
+        path: "/etc/postgresql/16/main/postgresql.conf"
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+      loop:
+        - { regexp: '^(listen_addresses|#listen_addresses)', line: "listen_addresses = '*'" }
+        - { regexp: '^(shared_buffers|#shared_buffers)', line: "shared_buffers = '{{ shared_buffers }}'" }
+        - { regexp: '^(max_connections|#max_connections)', line: "max_connections = '{{ max_connections }}'" }
+        - { regexp: '^(effective_cache_size|#effective_cache_size)', line: "effective_cache_size = '{{ effective_cache_size }}'" }
+        - { regexp: '^(work_mem|#work_mem)', line: "work_mem = '{{ work_mem }}'" }
+        - { regexp: '^(maintenance_work_mem|#maintenance_work_mem)', line: "maintenance_work_mem = '{{ maintenance_work_mem }}'" }
+        - { regexp: '^(checkpoint_timeout|#checkpoint_timeout)', line: "checkpoint_timeout = '{{ checkpoint_timeout }}'" }
+        - { regexp: '^(checkpoint_completion_target|#checkpoint_completion_target)', line: "checkpoint_completion_target = {{ checkpoint_completion_target }}" }
+        - { regexp: '^(max_wal_size|#max_wal_size)', line: "max_wal_size = '{{ max_wal_size }}'" }
+        - { regexp: '^(min_wal_size|#min_wal_size)', line: "min_wal_size = '{{ min_wal_size }}'" }
+        - { regexp: '^(logging_collector|#logging_collector)', line: "logging_collector = {{ logging_collector }}" }
+        - { regexp: '^(log_directory|#log_directory)', line: "log_directory = '{{ log_directory }}'" }
+        - { regexp: '^(log_filename|#log_filename)', line: "log_filename = '{{ log_filename }}'" }
+        - { regexp: '^(log_rotation_age|#log_rotation_age)', line: "log_rotation_age = '{{ log_rotation_age }}'" }
+        - { regexp: '^(log_rotation_size|#log_rotation_size)', line: "log_rotation_size = '{{ log_rotation_size }}'" }
+        - { regexp: '^(log_destination|#log_destination)', line: "log_destination = '{{ log_destination }}'" }
+        - { regexp: '^(port|#port)', line: "port = {{ postgresql_port }}" }
+
+    - name: Configure pg_hba.conf
+      lineinfile:
+        path: "/etc/postgresql/16/main/pg_hba.conf"
+        line: "host    all             all             0.0.0.0/0               md5"
+        state: present
+
+    - name: Configure pg_hba.conf for local connections
+      lineinfile:
+        path: "/etc/postgresql/16/main/pg_hba.conf"
+        regexp: '^local\s+all\s+all\s+peer'
+        line: "local   all             all                                     md5"
+        state: present
+
+    - name: Start PostgreSQL
+      command: systemctl start postgresql
+      command: systemctl restart postgresql
+
+    - name: Create PostgreSQL user
+      become_user: postgres
+      shell: psql -c "CREATE USER {{ db_user }} WITH PASSWORD '{{ db_password }}';"
+
+    - name: Disable root SSH login
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^PermitRootLogin'
+        line: 'PermitRootLogin no'
+        state: present
+
+    - name: Wise idea from gpt how to configure iptables-persistent on installation
+      shell: |
+        echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
+        echo "iptables-persistent iptables-persistent/autosave_v6 boolean false" | debconf-set-selections
+      become: yes
+
+    - name: Install iptables-persistent and rsyslog
+      apt:
+        name:
+          - iptables-persistent
+          - rsyslog
+        state: present
+
+    - name: Start rsyslog
+      service:
+        name: rsyslog
+        state: started
+        enabled: yes
+
+    - name: Flush iptables
+      shell: iptables -F
+
+    - name: Allow established connections
+      shell: iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    - name: Allow loopback
+      shell: iptables -A INPUT -i lo -j ACCEPT
+
+    - name: Allow SSH
+      shell: iptables -A INPUT -p tcp --dport {{ ssh_port }} -j ACCEPT
+
+    - name: Allow PostgreSQL
+      shell: iptables -A INPUT -p tcp --dport {{ postgresql_port }} -j ACCEPT
+
+    - name: Set default INPUT policy
+      shell: iptables -P INPUT DROP
+
+    - name: Enable iptables logging
+      shell: "iptables -A INPUT -j LOG --log-prefix 'iptables-dropped: ' --log-level 4"
+
+    - name: Save iptables rules
+      shell: iptables-save > /etc/iptables/rules.v4
+
+    - name: Configure rsyslog
+      shell: echo ':msg,contains,"iptables-dropped" /var/log/iptables.log' > /etc/rsyslog.d/iptables.conf
+      become: yes
+      
+    - name: Reboot server
+      shell: "nohup reboot &"
+      async: 1
+      poll: 0
+      become: yes
+
